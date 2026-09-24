@@ -1,0 +1,755 @@
+require("dotenv").config();
+
+const express = require("express");
+const pino = require("pino");
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  downloadMediaMessage,
+} = require("@whiskeysockets/baileys");
+
+const app = express();
+app.use(express.json());
+
+const PORT = process.env.PORT || 3000;
+const OWNER_NUMBER = cleanNumber(process.env.OWNER_NUMBER);
+const PAIRING_NUMBER = cleanNumber(process.env.PAIRING_NUMBER);
+const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD;
+
+if (!OWNER_NUMBER) {
+  throw new Error("OWNER_NUMBER is required");
+}
+
+if (!PAIRING_NUMBER) {
+  throw new Error("PAIRING_NUMBER is required");
+}
+
+if (!DASHBOARD_PASSWORD) {
+  throw new Error("DASHBOARD_PASSWORD is required");
+}
+
+let sock = null;
+let connected = false;
+let autoReplyEnabled = true;
+let mediaForwardEnabled = true;
+let pairingRequested = false;
+
+const cooldowns = new Map();
+
+function cleanNumber(value) {
+  return String(value || "").replace(/\D/g, "");
+}
+
+function ownerJid() {
+  return `${OWNER_NUMBER}@s.whatsapp.net`;
+}
+
+function isOwner(jid) {
+  if (!jid) return false;
+
+  const number = cleanNumber(String(jid).split("@")[0]);
+
+  return number === OWNER_NUMBER;
+}
+
+function isGroup(jid) {
+  return String(jid || "").endsWith("@g.us");
+}
+
+function isBroadcast(jid) {
+  return (
+    String(jid || "").endsWith("@broadcast") ||
+    String(jid || "").includes("status@broadcast")
+  );
+}
+
+function getText(message) {
+  return (
+    message?.conversation ||
+    message?.extendedTextMessage?.text ||
+    message?.imageMessage?.caption ||
+    message?.videoMessage?.caption ||
+    message?.documentMessage?.caption ||
+    ""
+  ).trim();
+}
+
+function getQuotedMessage(message) {
+  return message?.extendedTextMessage?.contextInfo?.quotedMessage || null;
+}
+
+function hasMedia(message) {
+  if (!message) return false;
+
+  return Boolean(
+    message.imageMessage ||
+    message.videoMessage ||
+    message.audioMessage ||
+    message.documentMessage ||
+    message.stickerMessage
+  );
+}
+
+function isViewOnce(message) {
+  if (!message) return false;
+
+  return Boolean(
+    message.viewOnceMessage ||
+    message.viewOnceMessageV2 ||
+    message.viewOnceMessageV2Extension ||
+    message.imageMessage?.viewOnce ||
+    message.videoMessage?.viewOnce
+  );
+}
+
+function unwrapQuoted(message) {
+  if (!message) return null;
+
+  if (message.ephemeralMessage?.message) {
+    return unwrapQuoted(message.ephemeralMessage.message);
+  }
+
+  if (message.viewOnceMessage?.message) {
+    return message.viewOnceMessage.message;
+  }
+
+  if (message.viewOnceMessageV2?.message) {
+    return message.viewOnceMessageV2.message;
+  }
+
+  if (message.viewOnceMessageV2Extension?.message) {
+    return message.viewOnceMessageV2Extension.message;
+  }
+
+  return message;
+}
+
+const replies = [
+  {
+    patterns: [/^asc$/i, /^aslm$/i, /^salaam$/i],
+    replies: ["wcs", "wcs soo dhawoow"]
+  },
+  {
+    patterns: [/see tahay/i, /seithy/i, /sidee tahay/i],
+    replies: [
+      "fcn Alhm adiga see tahay",
+      "fcn Alhm adiga呢"
+        .replace("呢", ""),
+      "Alhm waan fiicanahay adiga see tahay"
+    ]
+  },
+  {
+    patterns: [/xagee joogtaa/i, /xaggee joogtaa/i],
+    replies: [
+      "magaalada joogaa",
+      "halkan ayaan joogaa",
+      "magaalada ayaan joogaa"
+    ]
+  },
+  {
+    patterns: [/waryaa/i, /war yaa/i],
+    replies: [
+      "hee waryaa 😂",
+      "hee waryaa",
+      "war hee 😂"
+    ]
+  },
+  {
+    patterns: [/maxaa cusub/i],
+    replies: [
+      "wax cusub ma jiro",
+      "waxba cusub ma jiraan",
+      "iska caadi"
+    ]
+  },
+  {
+    patterns: [/maxaa wadaa/i, /maxaad wadaa/i],
+    replies: [
+      "iska joogaa adiga",
+      "waxba iska joogaa",
+      "iska caadi ayaan ahay"
+    ]
+  },
+  {
+    patterns: [/ma joogtaa/i],
+    replies: [
+      "haa waan joogaa",
+      "haa waan joogaa halkan",
+      "waan joogaa"
+    ]
+  },
+  {
+    patterns: [/hurudaa/i, /ma hurudaa/i],
+    replies: [
+      "maya waan joogaa",
+      "maya wali waan joogaa",
+      "maya ma hurdo"
+    ]
+  },
+  {
+    patterns: [/yaa tahay/i],
+    replies: [
+      "aniga Abdullahi Bot",
+      "Abdullahi Bot ayaan ahay"
+    ]
+  },
+  {
+    patterns: [/^ok$/i, /^okay$/i, /^haye$/i],
+    replies: [
+      "haye",
+      "haye waaye",
+      "oky"
+    ]
+  },
+  {
+    patterns: [/mahadsanid/i, /thanks/i],
+    replies: [
+      "adigaa mudan",
+      "soo dhawoow",
+      "waxba ma aha"
+    ]
+  },
+  {
+    patterns: [/subax wanaagsan/i],
+    replies: [
+      "subax wanaagsan",
+      "subax wanaagsan walaal"
+    ]
+  },
+  {
+    patterns: [/habeen wanaagsan/i],
+    replies: [
+      "habeen wanaagsan",
+      "habeen wanaagsan walaal"
+    ]
+  },
+  {
+    patterns: [/halkee/i, /xagee/i],
+    replies: [
+      "halkan ayaan joogaa",
+      "magaalada ayaan joogaa"
+    ]
+  },
+  {
+    patterns: [/maxaad haysaa/i],
+    replies: [
+      "wax badan ma hayo",
+      "waxba gaar ah ma hayo"
+    ]
+  },
+  {
+    patterns: [/ma fiican tahay/i],
+    replies: [
+      "haa Alhm waan fiicanahay",
+      "Alhm waan fiicanahay"
+    ]
+  },
+  {
+    patterns: [/waad joogtaa/i],
+    replies: [
+      "haa waan joogaa",
+      "haa"
+    ]
+  }
+];
+
+function randomItem(list) {
+  return list[Math.floor(Math.random() * list.length)];
+}
+
+function findAutoReply(text) {
+  for (const group of replies) {
+    for (const pattern of group.patterns) {
+      if (pattern.test(text)) {
+        return randomItem(group.replies);
+      }
+    }
+  }
+
+  return null;
+}
+
+function canReply(jid) {
+  const now = Date.now();
+  const previous = cooldowns.get(jid) || 0;
+
+  if (now - previous < 30000) {
+    return false;
+  }
+
+  cooldowns.set(jid, now);
+  return true;
+}
+
+function dashboardAuth(req, res, next) {
+  const password = req.headers["x-dashboard-password"];
+
+  if (password !== DASHBOARD_PASSWORD) {
+    return res.status(401).json({
+      ok: false,
+      error: "Unauthorized"
+    });
+  }
+
+  next();
+}
+
+app.get("/", (req, res) => {
+  res.send(`
+<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Somali WhatsApp Bot</title>
+<style>
+body{
+  font-family:Arial,sans-serif;
+  background:#f3f4f6;
+  padding:20px;
+}
+.card{
+  max-width:500px;
+  margin:auto;
+  background:white;
+  padding:20px;
+  border-radius:16px;
+}
+input,button{
+  width:100%;
+  padding:12px;
+  margin-top:10px;
+  box-sizing:border-box;
+}
+button{
+  cursor:pointer;
+}
+.status{
+  padding:12px;
+  margin:12px 0;
+  background:#eee;
+  border-radius:10px;
+}
+</style>
+</head>
+<body>
+<div class="card">
+<h2>Somali WhatsApp Bot</h2>
+
+<input id="password" type="password" placeholder="Dashboard password">
+
+<button onclick="login()">Login</button>
+
+<div id="panel" style="display:none">
+
+<div class="status">
+Bot status: <b id="status">Checking...</b>
+</div>
+
+<button onclick="toggleAuto()">Auto Reply ON/OFF</button>
+<button onclick="toggleMedia()">Media Forward ON/OFF</button>
+
+<p id="settings"></p>
+
+</div>
+</div>
+
+<script>
+let password = "";
+
+async function api(url, options={}) {
+  options.headers = {
+    ...(options.headers || {}),
+    "x-dashboard-password": password,
+    "Content-Type": "application/json"
+  };
+
+  const r = await fetch(url, options);
+  return r.json();
+}
+
+async function login(){
+  password = document.getElementById("password").value;
+
+  const data = await api("/api/status");
+
+  if(!data.ok){
+    alert("Password khalad ah");
+    return;
+  }
+
+  document.getElementById("panel").style.display = "block";
+  update(data);
+}
+
+function update(data){
+  document.getElementById("status").textContent =
+    data.connected ? "Connected" : "Disconnected";
+
+  document.getElementById("settings").textContent =
+    "Auto Reply: " + (data.autoReply ? "ON" : "OFF") +
+    " | Media Forward: " + (data.mediaForward ? "ON" : "OFF");
+}
+
+async function toggleAuto(){
+  const data = await api("/api/toggle-auto", {method:"POST"});
+  update(data);
+}
+
+async function toggleMedia(){
+  const data = await api("/api/toggle-media", {method:"POST"});
+  update(data);
+}
+
+setInterval(async()=>{
+  if(password){
+    const data = await api("/api/status");
+    if(data.ok) update(data);
+  }
+},10000);
+</script>
+</body>
+</html>
+`);
+});
+
+app.get("/api/status", dashboardAuth, (req, res) => {
+  res.json({
+    ok: true,
+    connected,
+    autoReply: autoReplyEnabled,
+    mediaForward: mediaForwardEnabled
+  });
+});
+
+app.post("/api/toggle-auto", dashboardAuth, (req, res) => {
+  autoReplyEnabled = !autoReplyEnabled;
+
+  res.json({
+    ok: true,
+    connected,
+    autoReply: autoReplyEnabled,
+    mediaForward: mediaForwardEnabled
+  });
+});
+
+app.post("/api/toggle-media", dashboardAuth, (req, res) => {
+  mediaForwardEnabled = !mediaForwardEnabled;
+
+  res.json({
+    ok: true,
+    connected,
+    autoReply: autoReplyEnabled,
+    mediaForward: mediaForwardEnabled
+  });
+});
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Dashboard running on port ${PORT}`);
+});
+
+async function sendNormalMediaToOwner(message) {
+  if (!sock || !mediaForwardEnabled) return false;
+
+  const original = unwrapQuoted(message);
+
+  if (!original || !hasMedia(original)) {
+    return false;
+  }
+
+  if (isViewOnce(original)) {
+    console.log("View Once media ignored");
+    return false;
+  }
+
+  try {
+    const fakeMessage = {
+      key: message.key,
+      message: original
+    };
+
+    const buffer = await downloadMediaMessage(
+      fakeMessage,
+      "buffer",
+      {},
+      {
+        logger: pino({ level: "silent" })
+      }
+    );
+
+    if (original.imageMessage) {
+      await sock.sendMessage(ownerJid(), {
+        image: buffer,
+        caption: original.imageMessage.caption || ""
+      });
+    } else if (original.videoMessage) {
+      await sock.sendMessage(ownerJid(), {
+        video: buffer,
+        caption: original.videoMessage.caption || "",
+        mimetype: original.videoMessage.mimetype
+      });
+    } else if (original.audioMessage) {
+      await sock.sendMessage(ownerJid(), {
+        audio: buffer,
+        mimetype: original.audioMessage.mimetype,
+        ptt: Boolean(original.audioMessage.ptt)
+      });
+    } else if (original.documentMessage) {
+      await sock.sendMessage(ownerJid(), {
+        document: buffer,
+        mimetype: original.documentMessage.mimetype,
+        fileName: original.documentMessage.fileName || "file"
+      });
+    } else if (original.stickerMessage) {
+      await sock.sendMessage(ownerJid(), {
+        sticker: buffer
+      });
+    } else {
+      return false;
+    }
+
+    return true;
+  } catch (error) {
+    console.error("Media forwarding error:", error.message);
+    return false;
+  }
+}
+
+async function handleCommand(message, jid, text) {
+  if (!isOwner(jid)) return false;
+
+  const command = text.toLowerCase();
+
+  if (command === ".vv") {
+    const quoted = getQuotedMessage(message);
+
+    if (!quoted) {
+      await sock.sendMessage(jid, {
+        text: "reply garee normal media kadib .vv qor"
+      });
+      return true;
+    }
+
+    if (isViewOnce(quoted)) {
+      await sock.sendMessage(jid, {
+        text: "View Once lama soo celin karo"
+      });
+      return true;
+    }
+
+    if (!hasMedia(quoted)) {
+      await sock.sendMessage(jid, {
+        text: "normal media reply garee kadib .vv qor"
+      });
+      return true;
+    }
+
+    const fake = {
+      key: message.key,
+      message: quoted
+    };
+
+    try {
+      const buffer = await downloadMediaMessage(
+        fake,
+        "buffer",
+        {},
+        {
+          logger: pino({ level: "silent" })
+        }
+      );
+
+      if (quoted.imageMessage) {
+        await sock.sendMessage(ownerJid(), {
+          image: buffer,
+          caption: quoted.imageMessage.caption || ""
+        });
+      } else if (quoted.videoMessage) {
+        await sock.sendMessage(ownerJid(), {
+          video: buffer,
+          caption: quoted.videoMessage.caption || "",
+          mimetype: quoted.videoMessage.mimetype
+        });
+      } else if (quoted.audioMessage) {
+        await sock.sendMessage(ownerJid(), {
+          audio: buffer,
+          mimetype: quoted.audioMessage.mimetype,
+          ptt: Boolean(quoted.audioMessage.ptt)
+        });
+      } else if (quoted.documentMessage) {
+        await sock.sendMessage(ownerJid(), {
+          document: buffer,
+          mimetype: quoted.documentMessage.mimetype,
+          fileName: quoted.documentMessage.fileName || "file"
+        });
+      } else if (quoted.stickerMessage) {
+        await sock.sendMessage(ownerJid(), {
+          sticker: buffer
+        });
+      }
+
+      await sock.sendMessage(jid, {
+        text: "waa la diray"
+      });
+    } catch (error) {
+      console.error(".vv error:", error.message);
+
+      await sock.sendMessage(jid, {
+        text: "media-ga lama diri karin"
+      });
+    }
+
+    return true;
+  }
+
+  if (command === "send") {
+    const quoted = getQuotedMessage(message);
+
+    if (!quoted) {
+      await sock.sendMessage(jid, {
+        text: "reply garee normal status media kadib send qor"
+      });
+      return true;
+    }
+
+    if (isViewOnce(quoted)) {
+      await sock.sendMessage(jid, {
+        text: "View Once lama soo celin karo"
+      });
+      return true;
+    }
+
+    if (!hasMedia(quoted)) {
+      await sock.sendMessage(jid, {
+        text: "normal status media reply garee kadib send qor"
+      });
+      return true;
+    }
+
+    const ok = await sendNormalMediaToOwner(message);
+
+    await sock.sendMessage(jid, {
+      text: ok ? "waa la diray" : "media-ga lama diri karin"
+    });
+
+    return true;
+  }
+
+  return false;
+}
+
+async function startBot() {
+  const { state, saveCreds } = await useMultiFileAuthState("./auth");
+
+  sock = makeWASocket({
+    auth: state,
+    printQRInTerminal: false,
+    logger: pino({ level: "silent" }),
+    browser: ["Somali WhatsApp Bot", "Chrome", "1.0.0"]
+  });
+
+  sock.ev.on("creds.update", saveCreds);
+
+  sock.ev.on("connection.update", async (update) => {
+    const { connection, lastDisconnect } = update;
+
+    if (connection === "open") {
+      connected = true;
+      pairingRequested = false;
+
+      console.log("WhatsApp connected");
+    }
+
+    if (connection === "close") {
+      connected = false;
+
+      const statusCode =
+        lastDisconnect?.error?.output?.statusCode;
+
+      console.log("WhatsApp disconnected", statusCode);
+
+      if (statusCode !== DisconnectReason.loggedOut) {
+        setTimeout(() => {
+          startBot().catch(console.error);
+        }, 5000);
+      } else {
+        console.log("WhatsApp logged out");
+      }
+    }
+
+    if (
+      !state.creds.registered &&
+      !pairingRequested
+    ) {
+      pairingRequested = true;
+
+      try {
+        const code = await sock.requestPairingCode(PAIRING_NUMBER);
+
+        console.log("");
+        console.log("================================");
+        console.log("WHATSAPP PAIRING CODE");
+        console.log(code);
+        console.log("================================");
+        console.log("");
+      } catch (error) {
+        pairingRequested = false;
+        console.error("Pairing code error:", error.message);
+      }
+    }
+  });
+
+  sock.ev.on("messages.upsert", async ({ messages }) => {
+    for (const message of messages) {
+      try {
+        if (!message.message) continue;
+
+        const jid = message.key.remoteJid;
+
+        if (!jid) continue;
+
+        if (isGroup(jid)) continue;
+        if (isBroadcast(jid)) continue;
+
+        const text = getText(message.message);
+
+        if (!text) continue;
+
+        // Owner commands must work even when message.key.fromMe is true
+        if (message.key.fromMe && isOwner(jid)) {
+          await handleCommand(message.message, jid, text);
+          continue;
+        }
+
+        // Never auto reply to our own messages
+        if (message.key.fromMe) continue;
+
+        if (
+          text.toLowerCase() === ".vv" ||
+          text.toLowerCase() === "send"
+        ) {
+          continue;
+        }
+
+        if (!autoReplyEnabled) continue;
+
+        if (!canReply(jid)) continue;
+
+        const reply = findAutoReply(text);
+
+        if (!reply) continue;
+
+        await sock.sendMessage(jid, {
+          text: reply
+        });
+      } catch (error) {
+        console.error("Message handler error:", error.message);
+      }
+    }
+  });
+}
+
+startBot().catch((error) => {
+  console.error("Bot startup error:", error);
+  process.exit(1);
+});
